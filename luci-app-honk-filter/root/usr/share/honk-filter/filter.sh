@@ -22,8 +22,6 @@
 #   filter.sh custom-add <domain>
 #   filter.sh custom-remove <domain>
 
-set -f
-
 . /usr/share/libubox/jshn.sh 2>/dev/null
 . /lib/functions.sh 2>/dev/null
 . /usr/share/honk/lifecycle.sh 2>/dev/null
@@ -266,7 +264,8 @@ dns_apply() {
 	case "$fallback" in remote|default|accept) ;; *) fallback=remote ;; esac
 
 	local cand
-	cand=$(mktemp /etc/honk/.dns-cand.XXXXXX) || return 1
+	cand_dir=$(mktemp -d /etc/honk/.dns-cand.XXXXXX) || return 1
+	cand="$cand_dir/candidate.dae"
 	awk \
 		-v defup="$defup" -v remup="$remup" -v boot="$boot" \
 		-v fallback="$fallback" -v cache="$cache" -v ipv6="$ipv6" '
@@ -304,19 +303,19 @@ dns_apply() {
 			# For now IPv6 is controlled at the resolver level; keep a documented marker.
 			print line
 		}
-	' "$CFG" > "$cand" || { rm -f "$cand"; return 1; }
+	' "$CFG" > "$cand" || { rm -rf "$cand_dir"; return 1; }
 
 	if ! validate_candidate "$cand"; then
 		logline "dns_apply: validate failed, keeping old config"
-		rm -f "$cand"
+		rm -rf "$cand_dir"
 		return 1
 	fi
 	if ! apply_candidate "$cand"; then
 		logline "dns_apply: reload failed, rolled back"
-		rm -f "$cand"
+		rm -rf "$cand_dir"
 		return 1
 	fi
-	rm -f "$cand"
+	rm -rf "$cand_dir"
 	logline "dns_apply: ok"
 	return 0
 }
@@ -332,16 +331,17 @@ do_rebuild() {
 	count=$(printf '%s\n' "$domains" | grep -c . 2>/dev/null)
 	[ "$count" -le "$MAX_RULES" ] || { logline "rebuild: too many rules ($count)"; rm -f "$rules"; return 1; }
 
-	cand=$(mktemp /etc/honk/.filter-cand.XXXXXX) || { rm -f "$rules"; return 1; }
-	render_config "$rules" "$cand" || { rm -f "$rules" "$cand"; return 1; }
+	cand_dir=$(mktemp -d /etc/honk/.filter-cand.XXXXXX) || { rm -f "$rules"; return 1; }
+	cand="$cand_dir/candidate.dae"
+	render_config "$rules" "$cand" || { rm -f "$rules"; rm -rf "$cand_dir"; return 1; }
 	if ! validate_candidate "$cand"; then
 		logline "rebuild: validate failed, keeping old rules"
-		rm -f "$rules" "$cand"
+		rm -f "$rules"; rm -rf "$cand_dir"
 		return 1
 	fi
 	if ! apply_candidate "$cand"; then
 		logline "rebuild: reload failed, rolled back"
-		rm -f "$rules" "$cand"
+		rm -f "$rules"; rm -rf "$cand_dir"
 		return 1
 	fi
 	cp "$rules" "$RULE_FILE" 2>/dev/null
@@ -364,15 +364,16 @@ do_disable() {
 	local cand empty
 	empty=$(mktemp "$STATE_DIR/.empty.XXXXXX") || return 1
 	: > "$empty"
-	cand=$(mktemp /etc/honk/.filter-cand.XXXXXX) || { rm -f "$empty"; return 1; }
-	render_config "$empty" "$cand" || { rm -f "$empty" "$cand"; return 1; }
+	cand_dir=$(mktemp -d /etc/honk/.filter-cand.XXXXXX) || { rm -f "$empty"; return 1; }
+	cand="$cand_dir/candidate.dae"
+	render_config "$empty" "$cand" || { rm -f "$empty"; rm -rf "$cand_dir"; return 1; }
 	if validate_candidate "$cand" && apply_candidate "$cand"; then
 		printf '0\n' > "$STATE_DIR/rule_count" 2>/dev/null
 		logline "disabled"
-		rm -f "$empty" "$cand"
+		rm -f "$empty"; rm -rf "$cand_dir"
 		return 0
 	fi
-	rm -f "$empty" "$cand"
+	rm -f "$empty"; rm -rf "$cand_dir"
 	logline "disable: failed"
 	return 1
 }

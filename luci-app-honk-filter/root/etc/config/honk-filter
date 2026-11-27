@@ -3,7 +3,7 @@ config filter 'main'
 	option enabled '0'
 	option mode 'domain'
 
-config dns 'main'
+config dns 'dns'
 	option default_upstream 'https://223.5.5.5/dns-query?tls_server_name=dns.alidns.com'
 	option remote_upstream 'https://8.8.8.8/dns-query?tls_server_name=dns.google'
 	option bootstrap '1.1.1.1:53'
