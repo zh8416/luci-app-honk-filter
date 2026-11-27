@@ -24,7 +24,7 @@ const fCustomAdd = rpc.declare({ object: 'honk-filter', method: 'custom_add', pa
 const fCustomRemove = rpc.declare({ object: 'honk-filter', method: 'custom_remove', params: [ 'domain' ], expect: { '': {} } });
 const fDnsSave = rpc.declare({
 	object: 'honk-filter', method: 'dns_save',
-	params: [ 'default_upstream', 'remote_upstream', 'bootstrap', 'fallback', 'cache', 'ipv6' ], expect: { '': {} }
+	params: [ 'payload' ], expect: { '': {} }
 });
 const fDnsReset = rpc.declare({ object: 'honk-filter', method: 'dns_reset', expect: { '': {} } });
 const fImportText = rpc.declare({ object: 'honk-filter', method: 'import_text', params: [ 'content' ], expect: { '': {} } });

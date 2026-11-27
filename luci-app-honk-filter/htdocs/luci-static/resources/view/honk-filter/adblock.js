@@ -59,16 +59,22 @@ return view.extend({
 		const logs = (data[2] && data[2].logs) || '';
 
 		const enabled = !!(status.enabled === true || status.enabled === 1 || status.enabled === 'true');
+		const active = !!(status.active === true || status.active === 1 || status.active === 'true');
 		const rules = status.rules || 0;
 		const last = fmtTime(status.last_update);
 
 		/* ---- status card ---- */
-		const statusBadge = badge(enabled);
+		const statusBadge = badge(active);
 		const toggle = switchControl('hkf-enable', enabled, function(on) {
 			ui.showModal(_('Applying…'), E('p', {}, _('Please wait.')));
 			f.setEnabled(on).then(function(res) {
 				ui.hideModal();
-				if (f.isOk(res)) { location.reload(); }
+				if (f.isOk(res)) {
+					const m = f.msg(res, '');
+					if (on && /applied:0/.test(m))
+						ui.addNotification(null, E('p', {}, _('Filter enabled but 0 domains: add/download a rule source first.')));
+					location.reload();
+				}
 				else { ui.addNotification(null, E('p', {}, f.msg(res, _('Failed to apply')))); }
 			}).catch(function(e) {
 				ui.hideModal();
@@ -120,7 +126,9 @@ return view.extend({
 					upBtn.disabled = true;
 					f.sourceUpdate(s.section).then(function(res) {
 						upBtn.disabled = false;
-						ui.addNotification(null, E('p', {}, f.msg(res, _('Done'))));
+						const ok = f.isOk(res);
+						ui.addNotification(null, E('p', {}, (ok ? _('Update: ') : _('Update failed: ')) + f.msg(res, '')));
+						if (ok) setTimeout(function() { location.reload(); }, 2500);
 					}).catch(function(e) { upBtn.disabled = false; ui.addNotification(null, E('p', {}, e.message)); });
 				});
 				const rmBtn = E('button', { 'class': 'hkf-btn danger', 'type': 'button' }, _('Remove'));
@@ -161,7 +169,10 @@ return view.extend({
 			addBtn.disabled = true;
 			f.sourceAdd(name, url, fmtIn.value, '', 86400, true).then(function(res) {
 				addBtn.disabled = false;
-				if (f.isOk(res)) location.reload();
+				if (f.isOk(res)) {
+					ui.addNotification(null, E('p', {}, _('Source added: ') + f.msg(res, '')));
+					setTimeout(function() { location.reload(); }, 2500);
+				}
 				else ui.addNotification(null, E('p', {}, f.msg(res, _('Failed to add'))));
 			}).catch(function(e) { addBtn.disabled = false; ui.addNotification(null, E('p', {}, e.message)); });
 		});

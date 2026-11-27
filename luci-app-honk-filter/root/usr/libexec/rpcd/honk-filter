@@ -26,15 +26,26 @@ emit_result() {
 }
 
 read_payload() {
-	PAYLOAD=$(head -c 16384)
+	PAYLOAD=$(head -c 65536)
 	[ -n "$PAYLOAD" ] || PAYLOAD='{}'
 	json_load "$PAYLOAD" 2>/dev/null || return 1
 	return 0
 }
 
+_read_dns_upstream() {
+	local s=$1 a g o
+	config_get a "$s" address ''
+	config_get g "$s" group default
+	config_get o "$s" outbound ''
+	[ -n "$a" ] || return 0
+	[ -n "$DNS_UPSTREAMS" ] && DNS_UPSTREAMS="$DNS_UPSTREAMS
+"
+	DNS_UPSTREAMS="${DNS_UPSTREAMS}${a}$(printf '\t')${g}$(printf '\t')${o}"
+}
+
 case "$1" in
 	list)
-		echo '{"status":{},"sources":{},"logs":{},"dns_read":{},"source_add":{"name":"String","url":"String","format":"String","ua":"String","interval":"String","enabled":"Boolean"},"source_remove":{"section":"String"},"source_toggle":{"section":"String","enabled":"Boolean"},"source_update":{"section":"String"},"rebuild":{},"set_enabled":{"enabled":"Boolean"},"whitelist_add":{"domain":"String"},"whitelist_remove":{"domain":"String"},"custom_add":{"domain":"String"},"custom_remove":{"domain":"String"},"dns_save":{"default_upstream":"String","remote_upstream":"String","bootstrap":"String","fallback":"String","cache":"Boolean","ipv6":"Boolean"},"dns_reset":{},"import_text":{"content":"String"},"import_file":{}}'
+		echo '{"status":{},"sources":{},"logs":{},"dns_read":{},"source_add":{"name":"String","url":"String","format":"String","ua":"String","interval":"String","enabled":"Boolean"},"source_remove":{"section":"String"},"source_toggle":{"section":"String","enabled":"Boolean"},"source_update":{"section":"String"},"rebuild":{},"set_enabled":{"enabled":"Boolean"},"whitelist_add":{"domain":"String"},"whitelist_remove":{"domain":"String"},"custom_add":{"domain":"String"},"custom_remove":{"domain":"String"},"dns_save":{"payload":"String"},"dns_reset":{},"import_text":{"content":"String"},"import_file":{}}'
 		;;
 	call)
 		case "$2" in
@@ -48,6 +59,9 @@ case "$1" in
 				"$FILTER" logs
 				;;
 			dns_read)
+				DNS_UPSTREAMS=''
+				config_load honk-filter
+				config_foreach _read_dns_upstream dns_server
 				json_init
 				json_add_string default_upstream "$(uci -q get honk-filter.dns.default_upstream)"
 				json_add_string remote_upstream "$(uci -q get honk-filter.dns.remote_upstream)"
@@ -55,6 +69,7 @@ case "$1" in
 				json_add_string fallback "$(uci -q get honk-filter.dns.fallback)"
 				json_add_boolean cache "$(uci -q get honk-filter.dns.cache 2>/dev/null || echo 1)"
 				json_add_boolean ipv6 "$(uci -q get honk-filter.dns.ipv6 2>/dev/null || echo 1)"
+				json_add_string upstreams "$DNS_UPSTREAMS"
 				json_dump
 				;;
 			source_add)
@@ -80,7 +95,14 @@ case "$1" in
 				uci -q set "honk-filter.$sec.fail_count=0"
 				uci -q commit honk-filter
 				[ "$enabled" = 1 ] && "$CRON" enable >/dev/null 2>&1
-				emit_result true added
+				# Fetch immediately so the user sees a real download result.
+				result=$("$UPDATER" one "$sec" 2>/dev/null)
+				dl=$?
+				if [ "$dl" -eq 0 ]; then
+					emit_result true "added; $result"
+				else
+					emit_result true "saved; download failed: $result"
+				fi
 				;;
 			source_remove)
 				read_payload || { emit_result false invalid_request; exit 1; }
@@ -106,8 +128,10 @@ case "$1" in
 				read_payload || { emit_result false invalid_request; exit 1; }
 				json_get_var section section
 				case "$section" in ''|*[!A-Za-z0-9_]*) section= ;; esac
-				if [ -n "$section" ]; then "$UPDATER" one "$section" >/dev/null 2>&1; else "$UPDATER" all >/dev/null 2>&1; fi
-				emit_result true update_finished
+				if [ -n "$section" ]; then result=$("$UPDATER" one "$section" 2>/dev/null); else result=$("$UPDATER" all 2>/dev/null); fi
+				rc=$?
+				# result is a JSON summary; relay its details in the message.
+				if [ "$rc" -eq 0 ]; then emit_result true "$result"; else emit_result false "$result"; fi
 				;;
 			rebuild)
 				n=$("$FILTER" rebuild 2>/dev/null)
@@ -118,8 +142,12 @@ case "$1" in
 				read_payload || { emit_result false invalid_request; exit 1; }
 				json_get_var enabled enabled
 				[ "$enabled" = 1 ] || [ "$enabled" = true ] && enabled=1 || enabled=0
-				if [ "$enabled" = 1 ]; then "$FILTER" enable >/dev/null 2>&1; else "$FILTER" disable >/dev/null 2>&1; fi
-				[ $? -eq 0 ] && emit_result true applied || emit_result false apply_failed
+				if [ "$enabled" = 1 ]; then out=$("$FILTER" enable 2>/dev/null); else out=$("$FILTER" disable 2>/dev/null); fi
+				if [ $? -eq 0 ]; then
+					emit_result true "applied:${out:-0} domains"
+				else
+					emit_result false apply_failed
+				fi
 				;;
 			whitelist_add)
 				read_payload || { emit_result false invalid_request; exit 1; }
@@ -143,19 +171,38 @@ case "$1" in
 				;;
 			dns_save)
 				read_payload || { emit_result false invalid_request; exit 1; }
+				json_get_var payload payload
+				json_load "$payload" 2>/dev/null || { emit_result false invalid_payload; exit 1; }
 				json_get_var default_upstream default_upstream
 				json_get_var remote_upstream remote_upstream
 				json_get_var bootstrap bootstrap
 				json_get_var fallback fallback
 				json_get_var cache cache
 				json_get_var ipv6 ipv6
-				# Values go through quoted uci set, so only reject empty/whitespace.
-				case "$default_upstream" in ''|*' '*|*'	'*) emit_result false invalid_upstream; exit 1 ;; esac
-				case "$remote_upstream" in ''|*' '*|*'	'*) emit_result false invalid_upstream; exit 1 ;; esac
+				json_get_var upstreams upstreams
 				case "$bootstrap" in ''|*' '*|*'	'*) emit_result false invalid_bootstrap; exit 1 ;; esac
-				case "$fallback" in remote|default|accept) ;; *) emit_result false invalid_fallback; exit 1 ;; esac
+				case "$fallback" in remote|default|accept|asis) ;; *) emit_result false invalid_fallback; exit 1 ;; esac
 				[ "$cache" = 1 ] || [ "$cache" = true ] && cache=1 || cache=0
 				[ "$ipv6" = 1 ] || [ "$ipv6" = true ] && ipv6=1 || ipv6=0
+
+				tmp=$(mktemp /tmp/hf-dns.XXXXXX) || { emit_result false temp_failed; exit 1; }
+				printf '%s\n' "$upstreams" > "$tmp"
+				while uci show honk-filter | grep -q '=dns_server'; do
+					old=$(uci show honk-filter | awk -F'[.=]' '/=dns_server$/{print $2; exit}')
+					uci -q delete "honk-filter.$old"
+				done
+				while IFS="$(printf '\t')" read -r addr grp out; do
+					case "$addr" in ''|*' '*|*'	'*) continue ;; esac
+					case "$grp" in default|remote) ;; *) grp=default ;; esac
+					case "$out" in direct|proxy) ;; *) out=auto ;; esac
+					sec=$(uci -q add honk-filter dns_server)
+					uci -q set "honk-filter.$sec.address=$addr"
+					uci -q set "honk-filter.$sec.group=$grp"
+					uci -q set "honk-filter.$sec.outbound=$out"
+					uci -q set "honk-filter.$sec.enabled=1"
+				done < "$tmp"
+				rm -f "$tmp"
+
 				uci -q set honk-filter.dns.default_upstream="$default_upstream"
 				uci -q set honk-filter.dns.remote_upstream="$remote_upstream"
 				uci -q set honk-filter.dns.bootstrap="$bootstrap"
@@ -163,11 +210,24 @@ case "$1" in
 				uci -q set honk-filter.dns.cache="$cache"
 				uci -q set honk-filter.dns.ipv6="$ipv6"
 				uci -q commit honk-filter
-				# Write into Honk config.dae with validate + rollback. Keep UCI on failure.
 				"$FILTER" dns-apply >/dev/null 2>&1 || { emit_result false apply_failed_uci_saved; exit 1; }
 				emit_result true saved
 				;;
 			dns_reset)
+				while uci show honk-filter | grep -q '=dns_server'; do
+					old=$(uci show honk-filter | awk -F'[.=]' '/=dns_server$/{print $2; exit}')
+					uci -q delete "honk-filter.$old"
+				done
+				dsec=$(uci -q add honk-filter dns_server)
+				uci -q set "honk-filter.$dsec.address=https://223.5.5.5/dns-query?tls_server_name=dns.alidns.com"
+				uci -q set "honk-filter.$dsec.group=default"
+				uci -q set "honk-filter.$dsec.outbound=direct"
+				uci -q set "honk-filter.$dsec.enabled=1"
+				rsec=$(uci -q add honk-filter dns_server)
+				uci -q set "honk-filter.$rsec.address=https://8.8.8.8/dns-query?tls_server_name=dns.google"
+				uci -q set "honk-filter.$rsec.group=remote"
+				uci -q set "honk-filter.$rsec.outbound=proxy"
+				uci -q set "honk-filter.$rsec.enabled=1"
 				uci -q set honk-filter.dns.default_upstream='https://223.5.5.5/dns-query?tls_server_name=dns.alidns.com'
 				uci -q set honk-filter.dns.remote_upstream='https://8.8.8.8/dns-query?tls_server_name=dns.google'
 				uci -q set honk-filter.dns.bootstrap='1.1.1.1:53'

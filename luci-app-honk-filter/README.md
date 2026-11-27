@@ -19,10 +19,12 @@ Honk 原生风格的**广告拦截 + DNS 分流**管理页面，规则直接写�
 - **更新日志**：下载与重建记录
 
 ### 服务 → Honk → DNS
-- 国内 DNS（default upstream）、远程 DNS（remote upstream）
+- **多个 DNS 上游**：可任意增删，每条指定地址、分组（国内 / 远程）和出站（自动 / 直连 / 代理）
+- 第一个国内上游成为 `default`、第一个远程上游成为 `remote`，沿用 Honk 默认路由规则；其余以 `default2`、`remote2`… 命名，可在 Doona 或自定义 DNS 路由中引用
 - Bootstrap resolver、默认回退（fallback）
 - DNS 缓存开关、IPv6/AAAA 开关
-- 一键恢复默认
+- 一键恢复默认（重建两条默认上游）
+- Honk 规定单个上游只能有一个地址，多个地址必须写成多个命名上游
 
 所有写操作都经过 `honk-core config validate`，失败自动回滚，不会破坏正在运行的配置。
 
@@ -60,7 +62,8 @@ make package/luci-app-honk-filter/compile -j$(nproc)
 
 ## 工作原理
 
-- 规则下载到 `/etc/honk/filter/sources/*.txt`
+- 规则下载到 `/etc/honk/filter/sources/*.txt`；下载器优先 `curl -4 --http1.1`，失败回退 `wget -4`，避免 OpenWrt 上 TLS `unexpected eof while reading` 与 AAAA 优先导致的假失败
+- 配置里自动写入 `pname(wget, curl) -> direct(must)`，让路由器本机的下载进程不被 honk 透明代理接管
 - 解析、去重、套用白名单后，生成 `domain(...) -> block` 规则
 - 通过**标记块**写入 `/etc/honk/config.dae` 顶层 `routing {}` 开头：
 
@@ -131,6 +134,7 @@ luci-app-honk-filter/
 
 - AAAA / HTTPS-SVCB / 防 DNS 泄露 / Apple 域名优化等高级开关尚未实现（部分需要 honk core 支持）
 - 自动更新 cron 固定为每天 03:00，暂未做每源独立周期
+- 多个 DNS 上游不会自动做轮询/故障切换，额外条目需自行在 Honk/Doona 路由规则中引用
 - 离线规则包通过粘贴文本导入，未做文件上传控件
 - 暂不提供查询日志与统计图表（这是 AdGuardHome 原生面板的强项，如需请另行安装）
 

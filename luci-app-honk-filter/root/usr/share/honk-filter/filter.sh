@@ -157,6 +157,9 @@ gen_dae_block() {
 	awk '
 		BEGIN {
 			print "    # honk-filter: generated block rules"
+			# Router-local downloaders must bypass the transparent proxy, or
+			# rule-source fetches get captured by honk and die with TLS EOF.
+			print "    pname(wget, curl) -> direct(must)"
 			print "    domain("
 			first = 1
 			n = 0
@@ -248,62 +251,105 @@ apply_candidate() {
 }
 
 # ---------- DNS routing ----------
-# Rewrite only specific field lines inside config.dae, preserving all other
-# user configuration. Each field is matched by its exact leading token.
+# Rewrite the dns.upstream block plus a few exact fields inside config.dae.
+# Every named dns_server UCI section becomes one Honk named upstream; the first
+# default/remote entries keep the names `default` / `remote` so the stock
+# routing rules keep working. Extra entries are available for split routing.
+_collect_dns_server() {
+	local s=$1 n a o g e
+	config_get n "$s" name ''
+	config_get a "$s" address ''
+	config_get o "$s" outbound ''
+	config_get g "$s" group default
+	config_get e "$s" enabled 1
+	[ "$e" = 1 ] && [ -n "$a" ] || return 0
+	case "$g" in
+		default)
+			DNS_DEFAULT_COUNT=$((DNS_DEFAULT_COUNT + 1))
+			if [ "$DNS_DEFAULT_COUNT" -eq 1 ]; then n=default; else n="default$DNS_DEFAULT_COUNT"; fi
+			;;
+		remote)
+			DNS_REMOTE_COUNT=$((DNS_REMOTE_COUNT + 1))
+			if [ "$DNS_REMOTE_COUNT" -eq 1 ]; then n=remote; else n="remote$DNS_REMOTE_COUNT"; fi
+			;;
+		*) [ -n "$n" ] || n="extra$DNS_EXTRA_COUNT"; DNS_EXTRA_COUNT=$((DNS_EXTRA_COUNT + 1)) ;;
+	esac
+	printf '%s\t%s\t%s\n' "$n" "$a" "$o" >> "$DNS_UPSTREAM_FILE"
+}
+
 dns_apply() {
-	local defup remup boot fallback cache ipv6
-	defup=$(uci -q get honk-filter.dns.default_upstream)
-	remup=$(uci -q get honk-filter.dns.remote_upstream)
-	boot=$(uci -q get honk-filter.dns.bootstrap)
-	fallback=$(uci -q get honk-filter.dns.fallback)
+	local cache ipv6 fallback bootstrap ups cand_dir cand
 	cache=$(uci -q get honk-filter.dns.cache 2>/dev/null); [ -n "$cache" ] || cache=1
 	ipv6=$(uci -q get honk-filter.dns.ipv6 2>/dev/null); [ -n "$ipv6" ] || ipv6=1
-	[ -n "$defup" ] || defup='https://223.5.5.5/dns-query?tls_server_name=dns.alidns.com'
-	[ -n "$remup" ] || remup='https://8.8.8.8/dns-query?tls_server_name=dns.google'
-	[ -n "$boot" ] || boot='1.1.1.1:53'
-	case "$fallback" in remote|default|accept) ;; *) fallback=remote ;; esac
+	fallback=$(uci -q get honk-filter.dns.fallback 2>/dev/null)
+	case "$fallback" in remote|default|accept|asis) ;; *) fallback=remote ;; esac
+	bootstrap=$(uci -q get honk-filter.dns.bootstrap 2>/dev/null)
+	[ -n "$bootstrap" ] || bootstrap='1.1.1.1:53'
 
-	local cand
-	cand_dir=$(mktemp -d /etc/honk/.dns-cand.XXXXXX) || return 1
+	ups="$STATE_DIR/.dns-upstreams.$$"
+	: > "$ups" || return 1
+	DNS_DEFAULT_COUNT=0; DNS_REMOTE_COUNT=0; DNS_EXTRA_COUNT=0
+	DNS_UPSTREAM_FILE=$ups
+	config_load honk-filter
+	config_foreach _collect_dns_server dns_server
+
+	# Backward compatibility: no dns_server sections -> use legacy dns fields.
+	if [ ! -s "$ups" ]; then
+		local du ru
+		du=$(uci -q get honk-filter.dns.default_upstream 2>/dev/null)
+		ru=$(uci -q get honk-filter.dns.remote_upstream 2>/dev/null)
+		[ -n "$du" ] && printf 'default\t%s\tdirect\n' "$du" >> "$ups"
+		[ -n "$ru" ] && printf 'remote\t%s\tproxy\n' "$ru" >> "$ups"
+	fi
+
+	cand_dir=$(mktemp -d /etc/honk/.dns-cand.XXXXXX) || { rm -f "$ups"; return 1; }
 	cand="$cand_dir/candidate.dae"
-	awk \
-		-v defup="$defup" -v remup="$remup" -v boot="$boot" \
-		-v fallback="$fallback" -v cache="$cache" -v ipv6="$ipv6" '
+	awk -v boot="$bootstrap" -v fallback="$fallback" -v cache="$cache" -v ups="$ups" '
+		function emit_upstreams(   line, n, a, o) {
+			while ((getline line < ups) > 0) {
+				n = line; sub(/\t.*/, "", n)
+				a = line; sub(/^[^\t]*\t/, "", a); sub(/\t.*/, "", a)
+				o = line; sub(/^.*\t/, "", o)
+				printf "        %s: '\''%s'\''", n, a
+				if (o != "" && o != "auto") printf " -> %s", o
+				print ""
+			}
+			close(ups)
+			print "        local: '\''udp://127.0.0.1:53'\'' -> direct"
+		}
 		{
 			line = $0
-			# global.bootstrap_resolver
 			if (line ~ /^[[:space:]]*bootstrap_resolver:[[:space:]]*/) {
-				match(line, /^[[:space:]]*/)
-				indent = substr(line, 1, RLENGTH)
+				match(line, /^[[:space:]]*/); indent = substr(line, 1, RLENGTH)
 				line = indent "bootstrap_resolver: '\''" boot "'\''"
 			}
-			# dns.upstream default / remote (only the ->direct / ->proxy lines)
-			else if (line ~ /^[[:space:]]*default:[[:space:]]*.*->[[:space:]]*direct/) {
-				match(line, /^[[:space:]]*/); indent = substr(line, 1, RLENGTH)
-				line = indent "default: '\''" defup "'\'' -> direct"
+			else if (line ~ /^    upstream[[:space:]]*\{[[:space:]]*$/) {
+				print line
+				emit_upstreams()
+				in_up = 1
+				next
 			}
-			else if (line ~ /^[[:space:]]*remote:[[:space:]]*.*->[[:space:]]*proxy/) {
-				match(line, /^[[:space:]]*/); indent = substr(line, 1, RLENGTH)
-				line = indent "remote: '\''" remup "'\'' -> proxy"
+			else if (in_up && line ~ /^    \}[[:space:]]*$/) {
+				print line
+				in_up = 0
+				next
 			}
-			# dns.routing.request.fallback (first fallback: remote inside dns block)
+			else if (in_up) { next }
 			else if (!fb_done && line ~ /^[[:space:]]*fallback:[[:space:]]*remote[[:space:]]*$/) {
 				match(line, /^[[:space:]]*/); indent = substr(line, 1, RLENGTH)
 				line = indent "fallback: " fallback
 				fb_done = 1
 			}
-			# experimental.cache_file.enabled
 			else if (line ~ /^[[:space:]]*cache_file[[:space:]]*\{/) { in_cache = 1 }
 			else if (in_cache && line ~ /^[[:space:]]*\}/) { in_cache = 0 }
 			else if (in_cache && line ~ /^[[:space:]]*enabled:[[:space:]]*(true|false)/) {
 				match(line, /^[[:space:]]*/); indent = substr(line, 1, RLENGTH)
 				line = indent "enabled: " (cache == 1 ? "true" : "false")
 			}
-			# AAAA: add a response rule flag marker comment for future core support.
-			# For now IPv6 is controlled at the resolver level; keep a documented marker.
 			print line
 		}
-	' "$CFG" > "$cand" || { rm -rf "$cand_dir"; return 1; }
+	' "$CFG" > "$cand" || { rm -f "$ups"; rm -rf "$cand_dir"; return 1; }
+	rm -f "$ups"
 
 	if ! validate_candidate "$cand"; then
 		logline "dns_apply: validate failed, keeping old config"
@@ -363,7 +409,8 @@ do_disable() {
 	ensure_state || return 1
 	local cand empty
 	empty=$(mktemp "$STATE_DIR/.empty.XXXXXX") || return 1
-	: > "$empty"
+	# Keep the local-fetch bypass even while filtering is disabled.
+	printf '    pname(wget, curl) -> direct(must)\n' > "$empty"
 	cand_dir=$(mktemp -d /etc/honk/.filter-cand.XXXXXX) || { rm -f "$empty"; return 1; }
 	cand="$cand_dir/candidate.dae"
 	render_config "$empty" "$cand" || { rm -f "$empty"; rm -rf "$cand_dir"; return 1; }
@@ -386,9 +433,10 @@ do_stats() {
 	ts=$(cat "$STATE_DIR/last_update" 2>/dev/null)
 	case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
 	enabled=$(uci -q get honk-filter.main.enabled 2>/dev/null)
-	[ "$enabled" = 1 ] && enabled=true || enabled=false
+	[ "$enabled" = 1 ] && enabled=1 || enabled=0
 	json_init
 	json_add_boolean enabled "$enabled"
+	json_add_boolean active "$([ "$enabled" = 1 ] && [ "$count" -gt 0 ] && echo 1 || echo 0)"
 	json_add_int rules "$count"
 	json_add_int last_update "$ts"
 	json_add_string rule_file "$RULE_FILE"
