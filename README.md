@@ -1,3 +1,10 @@
+> **本仓库是 [kenzok8/openwrt-honk](https://github.com/kenzok8/openwrt-honk) 的分支（zh8416 fork）。**
+> 新增了独立软件包 **`luci-app-honk-filter`**：在 Honk 原生界面里增加「广告拦截」和「DNS 分流」两个页面，
+> 规则直接写入 Honk 自身配置，不安装 AdGuardHome、不安装 mosdns、不叠加任何 DNS 层。
+> 详见 [luci-app-honk-filter/README.md](luci-app-honk-filter/README.md)。上游代码零改动，同步方法见该文档。
+
+---
+
 <p align="center"><img src="docs/site/assets/logo.png" width="96" height="96" alt="Honk"></p>
 
 <h1 align="center">openwrt-honk</h1>

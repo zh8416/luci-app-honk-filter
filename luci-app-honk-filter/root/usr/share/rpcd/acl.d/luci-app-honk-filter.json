@@ -1,0 +1,46 @@
+{
+	"luci-app-honk-filter": {
+		"description": "Grant access to Honk native AdBlock and DNS routing controls",
+		"read": {
+			"ubus": {
+				"honk-filter": [
+					"status",
+					"sources",
+					"dns_read",
+					"logs"
+				]
+			},
+			"uci": [
+				"honk-filter"
+			],
+			"file": {
+				"/usr/share/honk-filter/filter.sh": [ "exec" ],
+				"/usr/share/honk-filter/update.sh": [ "exec" ]
+			}
+		},
+		"write": {
+			"cgi-io": [ "upload" ],
+			"ubus": {
+				"honk-filter": [
+					"source_add",
+					"source_remove",
+					"source_toggle",
+					"source_update",
+					"rebuild",
+					"set_enabled",
+					"whitelist_add",
+					"whitelist_remove",
+					"custom_add",
+					"custom_remove",
+					"dns_save",
+					"dns_reset",
+					"import_text",
+					"import_file"
+				]
+			},
+			"uci": [
+				"honk-filter"
+			]
+		}
+	}
+}

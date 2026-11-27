@@ -1,0 +1,24 @@
+{
+	"admin/services/honk/adblock": {
+		"title": "AdBlock",
+		"order": 25,
+		"action": {
+			"type": "view",
+			"path": "honk-filter/adblock"
+		},
+		"depends": {
+			"acl": [ "luci-app-honk-filter" ]
+		}
+	},
+	"admin/services/honk/dns": {
+		"title": "DNS",
+		"order": 26,
+		"action": {
+			"type": "view",
+			"path": "honk-filter/dns"
+		},
+		"depends": {
+			"acl": [ "luci-app-honk-filter" ]
+		}
+	}
+}

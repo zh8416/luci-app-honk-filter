@@ -1,0 +1,214 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# ubus RPC backend for luci-app-honk-filter.
+# Mirrors the jshn conventions of the upstream honk rpcd script.
+
+set -f
+
+. /usr/share/libubox/jshn.sh
+. /lib/functions.sh
+
+FILTER=/usr/share/honk-filter/filter.sh
+UPDATER=/usr/share/honk-filter/update.sh
+CRON=/usr/share/honk-filter/cron.sh
+UPLOAD_ROOT=/tmp/honk-filter-upload
+UPLOAD_FILE=$UPLOAD_ROOT/rules.txt
+UPLOAD_LIMIT=8388608
+
+emit_result() {
+	local ok=$1 message=$2
+	[ "$ok" = true ] && ok=1 || ok=0
+	json_init
+	json_add_boolean ok "$ok"
+	json_add_string message "$message"
+	json_dump
+}
+
+read_payload() {
+	PAYLOAD=$(head -c 16384)
+	[ -n "$PAYLOAD" ] || PAYLOAD='{}'
+	json_load "$PAYLOAD" 2>/dev/null || return 1
+	return 0
+}
+
+case "$1" in
+	list)
+		echo '{"status":{},"sources":{},"logs":{},"dns_read":{},"source_add":{"name":"String","url":"String","format":"String","ua":"String","interval":"String","enabled":"Boolean"},"source_remove":{"section":"String"},"source_toggle":{"section":"String","enabled":"Boolean"},"source_update":{"section":"String"},"rebuild":{},"set_enabled":{"enabled":"Boolean"},"whitelist_add":{"domain":"String"},"whitelist_remove":{"domain":"String"},"custom_add":{"domain":"String"},"custom_remove":{"domain":"String"},"dns_save":{"default_upstream":"String","remote_upstream":"String","bootstrap":"String","fallback":"String","cache":"Boolean","ipv6":"Boolean"},"dns_reset":{},"import_text":{"content":"String"},"import_file":{}}'
+		;;
+	call)
+		case "$2" in
+			status)
+				"$FILTER" stats
+				;;
+			sources)
+				"$FILTER" sources
+				;;
+			logs)
+				"$FILTER" logs
+				;;
+			dns_read)
+				json_init
+				json_add_string default_upstream "$(uci -q get honk-filter.dns.default_upstream)"
+				json_add_string remote_upstream "$(uci -q get honk-filter.dns.remote_upstream)"
+				json_add_string bootstrap "$(uci -q get honk-filter.dns.bootstrap)"
+				json_add_string fallback "$(uci -q get honk-filter.dns.fallback)"
+				json_add_boolean cache "$(uci -q get honk-filter.dns.cache 2>/dev/null || echo 1)"
+				json_add_boolean ipv6 "$(uci -q get honk-filter.dns.ipv6 2>/dev/null || echo 1)"
+				json_dump
+				;;
+			source_add)
+				read_payload || { emit_result false invalid_request; exit 1; }
+				json_get_var name name
+				json_get_var url url
+				json_get_var format format
+				json_get_var ua ua
+				json_get_var enabled enabled
+				json_get_var interval interval
+				case "$name" in ''|*[!A-Za-z0-9_.-]*) emit_result false invalid_name; exit 1 ;; esac
+				case "$url" in http://*|https://*) ;; *) emit_result false invalid_url; exit 1 ;; esac
+				[ "$enabled" = 1 ] || [ "$enabled" = true ] && enabled=1 || enabled=0
+				[ -n "$interval" ] || interval=86400
+				case "$interval" in ''|*[!0-9]*) emit_result false invalid_interval; exit 1 ;; esac
+				sec=$(uci -q add honk-filter source)
+				uci -q set "honk-filter.$sec.name=$name"
+				uci -q set "honk-filter.$sec.url=$url"
+				uci -q set "honk-filter.$sec.format=${format:-auto}"
+				uci -q set "honk-filter.$sec.ua=$ua"
+				uci -q set "honk-filter.$sec.enabled=$enabled"
+				uci -q set "honk-filter.$sec.interval=$interval"
+				uci -q set "honk-filter.$sec.fail_count=0"
+				uci -q commit honk-filter
+				[ "$enabled" = 1 ] && "$CRON" enable >/dev/null 2>&1
+				emit_result true added
+				;;
+			source_remove)
+				read_payload || { emit_result false invalid_request; exit 1; }
+				json_get_var section section
+				case "$section" in ''|*[!A-Za-z0-9_]*) emit_result false invalid_section; exit 1 ;; esac
+				uci -q delete "honk-filter.$section"
+				uci -q commit honk-filter
+				rm -f "$UPLOAD_ROOT/../sources/$section.txt" 2>/dev/null
+				emit_result true removed
+				;;
+			source_toggle)
+				read_payload || { emit_result false invalid_request; exit 1; }
+				json_get_var section section
+				json_get_var enabled enabled
+				case "$section" in ''|*[!A-Za-z0-9_]*) emit_result false invalid_section; exit 1 ;; esac
+				[ "$enabled" = 1 ] || [ "$enabled" = true ] && enabled=1 || enabled=0
+				uci -q set "honk-filter.$section.enabled=$enabled"
+				uci -q commit honk-filter
+				[ "$enabled" = 1 ] && "$CRON" enable >/dev/null 2>&1
+				emit_result true toggled
+				;;
+			source_update)
+				read_payload || { emit_result false invalid_request; exit 1; }
+				json_get_var section section
+				case "$section" in ''|*[!A-Za-z0-9_]*) section= ;; esac
+				if [ -n "$section" ]; then "$UPDATER" one "$section" >/dev/null 2>&1; else "$UPDATER" all >/dev/null 2>&1; fi
+				emit_result true update_finished
+				;;
+			rebuild)
+				n=$("$FILTER" rebuild 2>/dev/null)
+				rc=$?
+				[ "$rc" -eq 0 ] && emit_result true "rebuilt:$n" || emit_result false rebuild_failed
+				;;
+			set_enabled)
+				read_payload || { emit_result false invalid_request; exit 1; }
+				json_get_var enabled enabled
+				[ "$enabled" = 1 ] || [ "$enabled" = true ] && enabled=1 || enabled=0
+				if [ "$enabled" = 1 ]; then "$FILTER" enable >/dev/null 2>&1; else "$FILTER" disable >/dev/null 2>&1; fi
+				[ $? -eq 0 ] && emit_result true applied || emit_result false apply_failed
+				;;
+			whitelist_add)
+				read_payload || { emit_result false invalid_request; exit 1; }
+				json_get_var domain domain
+				"$FILTER" whitelist-add "$domain" >/dev/null 2>&1 && emit_result true added || emit_result false invalid_domain
+				;;
+			whitelist_remove)
+				read_payload || { emit_result false invalid_request; exit 1; }
+				json_get_var domain domain
+				"$FILTER" whitelist-remove "$domain" >/dev/null 2>&1 && emit_result true removed || emit_result false invalid_domain
+				;;
+			custom_add)
+				read_payload || { emit_result false invalid_request; exit 1; }
+				json_get_var domain domain
+				"$FILTER" custom-add "$domain" >/dev/null 2>&1 && emit_result true added || emit_result false invalid_domain
+				;;
+			custom_remove)
+				read_payload || { emit_result false invalid_request; exit 1; }
+				json_get_var domain domain
+				"$FILTER" custom-remove "$domain" >/dev/null 2>&1 && emit_result true removed || emit_result false invalid_domain
+				;;
+			dns_save)
+				read_payload || { emit_result false invalid_request; exit 1; }
+				json_get_var default_upstream default_upstream
+				json_get_var remote_upstream remote_upstream
+				json_get_var bootstrap bootstrap
+				json_get_var fallback fallback
+				json_get_var cache cache
+				json_get_var ipv6 ipv6
+				# Values go through quoted uci set, so only reject empty/whitespace.
+				case "$default_upstream" in ''|*' '*|*'	'*) emit_result false invalid_upstream; exit 1 ;; esac
+				case "$remote_upstream" in ''|*' '*|*'	'*) emit_result false invalid_upstream; exit 1 ;; esac
+				case "$bootstrap" in ''|*' '*|*'	'*) emit_result false invalid_bootstrap; exit 1 ;; esac
+				case "$fallback" in remote|default|accept) ;; *) emit_result false invalid_fallback; exit 1 ;; esac
+				[ "$cache" = 1 ] || [ "$cache" = true ] && cache=1 || cache=0
+				[ "$ipv6" = 1 ] || [ "$ipv6" = true ] && ipv6=1 || ipv6=0
+				uci -q set honk-filter.dns.default_upstream="$default_upstream"
+				uci -q set honk-filter.dns.remote_upstream="$remote_upstream"
+				uci -q set honk-filter.dns.bootstrap="$bootstrap"
+				uci -q set honk-filter.dns.fallback="$fallback"
+				uci -q set honk-filter.dns.cache="$cache"
+				uci -q set honk-filter.dns.ipv6="$ipv6"
+				uci -q commit honk-filter
+				# Write into Honk config.dae with validate + rollback. Keep UCI on failure.
+				"$FILTER" dns-apply >/dev/null 2>&1 || { emit_result false apply_failed_uci_saved; exit 1; }
+				emit_result true saved
+				;;
+			dns_reset)
+				uci -q set honk-filter.dns.default_upstream='https://223.5.5.5/dns-query?tls_server_name=dns.alidns.com'
+				uci -q set honk-filter.dns.remote_upstream='https://8.8.8.8/dns-query?tls_server_name=dns.google'
+				uci -q set honk-filter.dns.bootstrap='1.1.1.1:53'
+				uci -q set honk-filter.dns.fallback='remote'
+				uci -q set honk-filter.dns.cache=1
+				uci -q set honk-filter.dns.ipv6=1
+				uci -q commit honk-filter
+				"$FILTER" dns-apply >/dev/null 2>&1 || { emit_result false apply_failed; exit 1; }
+				emit_result true reset
+				;;
+			import_text)
+				# Offline rule package pasted as text by the front-end.
+				read_payload || { emit_result false invalid_request; exit 1; }
+				json_get_var content content
+				[ -n "$content" ] || { emit_result false empty_content; exit 1; }
+				bytes=$(printf '%s' "$content" | wc -c | tr -d ' ')
+				case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
+				[ "$bytes" -le "$UPLOAD_LIMIT" ] || { emit_result false content_too_large; exit 1; }
+				mkdir -p /etc/honk/filter/sources 2>/dev/null || { emit_result false write_failed; exit 1; }
+				printf '%s\n' "$content" > /etc/honk/filter/sources/offline.txt 2>/dev/null || { emit_result false write_failed; exit 1; }
+				"$FILTER" rebuild >/dev/null 2>&1 || { emit_result false rebuild_failed; exit 1; }
+				emit_result true imported
+				;;
+			import_file)
+				# Reserved for cgi-io based file upload; reads the staged upload file.
+				[ -f "$UPLOAD_FILE" ] || { emit_result false no_file; exit 1; }
+				bytes=$(wc -c < "$UPLOAD_FILE" 2>/dev/null | tr -d ' ')
+				case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
+				[ "$bytes" -le "$UPLOAD_LIMIT" ] || { emit_result false file_too_large; exit 1; }
+				mkdir -p /etc/honk/filter/sources 2>/dev/null
+				cp "$UPLOAD_FILE" /etc/honk/filter/sources/offline.txt 2>/dev/null || { emit_result false copy_failed; exit 1; }
+				"$FILTER" rebuild >/dev/null 2>&1 || { emit_result false rebuild_failed; exit 1; }
+				emit_result true imported
+				;;
+			*)
+				emit_result false unknown_method
+				exit 1
+				;;
+		esac
+		;;
+	*)
+		exit 2
+		;;
+esac
